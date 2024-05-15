@@ -1,11 +1,9 @@
 use actix_web::{post, App, HttpServer, HttpResponse, Responder};
 use std::string::String;
-use reqwest::Client;
-use embryo::{Embryo, EmbryoList};
-use serde_json::{from_str,to_string};
-use serde::Serialize;
+use embryo::{ EmbryoList};
+use serde_json::{from_str};
 use std::collections::HashMap;
-use redis::{AsyncCommands,Commands,RedisError};
+use redis::{AsyncCommands,RedisError};
 
 /*
 * this looks in the cache for the query and returns the results
@@ -25,14 +23,14 @@ async fn cache_handler(body: String) -> impl Responder {
     let last: HashMap<String,String> =  from_str(&body).expect("Error while parsing json");
     let query: String = last.get("query").unwrap().to_string();
     let result: EmbryoList = serde_json::from_str(last.get("results").unwrap()).expect("wrong results format");
-    add_to_cache(query.clone(), result).await;
+    let _ = add_to_cache(query.clone(), result).await;
     HttpResponse::Ok().body(query)
 }
 
 async fn add_to_cache(query: String, results: EmbryoList) -> std::io::Result<()> {
     let client : redis::Client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
     let mut con = client.get_async_connection().await.unwrap();
-    con.set::<String,String, String>(query, serde_json::to_string(&results).unwrap()).await;
+    let _ = con.set::<String,String, String>(query, serde_json::to_string(&results).unwrap()).await;
     Ok(())
 }
 
@@ -48,7 +46,7 @@ async fn generate_embryo_list(json_string: String) -> EmbryoList {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let client : redis::Client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+    // let client : redis::Client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
     match em_filter::find_port().await {
         Some(port) => {
             let filter_url = format!("http://localhost:{}/query", port);
