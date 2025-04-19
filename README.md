@@ -1,8 +1,9 @@
-# EM cache
+em_cache2
+=====
 
-This service caches the client queries using redis.
+An OTP library
 
-two http routes are present using the post method:
+Build
+-----
 
-- `/query`: for getting the results of a previously stored query
-- `/cache`: for caching new results 
+    $ rebar3 compile
