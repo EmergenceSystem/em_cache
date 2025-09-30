@@ -1,107 +1,87 @@
+%%%-------------------------------------------------------------------
+%%% em_cache: HTTP cache API with Redis and Wade server.
+%%%-------------------------------------------------------------------
+
 -module(em_cache).
 
+%% API
 -export([start/0, init/0]).
 
--include_lib("kernel/include/logger.hrl").
-
-%% API exports for handlers
--export([query_handler/2, cache_handler/2]).
-
 %% Internal functions exported for testing
--export([add_to_cache/2, generate_embryo_list/1, register_filter/0, 
-         json_to_embryo_list/1, embryo_list_to_json/1]).
+-export([
+    add_to_cache/2, generate_embryo_list/1, register_filter/0,
+    json_to_embryo_list/1, embryo_list_to_json/1,
+    register_routes/0
+]).
 
-%% Records
+%% Handler functions for Wade
+-export([query_handler/1, cache_handler/1]).
+
+-include_lib("wade/include/wade.hrl").
+
 -record(embryo, {properties}).
 -record(embryo_list, {embryo_list}).
 
-%%====================================================================
-%% API functions
-%%====================================================================
+%%% ====================
+%%% API
+%%% ====================
 
-%% @doc Start the HTTP server
-start() ->
-    init().
+%% @doc Start the HTTP server and register Wade routes.
+-spec start() -> ok | {error, any()}.
+start() -> init().
 
-%% @doc Initialize the application
+-spec init() -> ok | {error, any()}.
 init() ->
-    application:ensure_all_started(cowboy),
     application:ensure_all_started(eredis),
     application:ensure_all_started(jsx),
-    
-    case find_port() of
-        {ok, Port} ->
-            FilterUrl = io_lib:format("http://localhost:~B/query", [Port]),
-            io:format("Filter registered: ~s~n", [FilterUrl]),
-            register_filter(),
-            
-            Dispatch = cowboy_router:compile([
-                {'_', [
-                    {"/query", em_cache, query},
-                    {"/cache", em_cache, cache}
-                ]}
-            ]),
-            
-            {ok, _} = cowboy:start_clear(
-                em_cache_http_listener,
-                [{port, Port}],
-                #{env => #{dispatch => Dispatch}}
-            ),
-            
-            {ok, Port};
-        {error, Reason} ->
-            io:format("Can't start: ~p~n", [Reason]),
-            {error, Reason}
-    end.
+    {ok, Port} = find_port(),
+    {ok, _Pid} = wade:start_link(Port),
+    register_routes(),
+    io:format("Started em_cache on port ~p~n", [Port]),
+    register_filter(),
+    ok.
 
-%%====================================================================
-%% Cowboy Handler Callbacks
-%%====================================================================
+%% @doc Register HTTP POST routes for /query and /cache.
+-spec register_routes() -> ok.
+register_routes() ->
+    wade:route(post, "/query", fun ?MODULE:query_handler/1, []),
+    wade:route(post, "/cache", fun ?MODULE:cache_handler/1, []),
+    ok.
 
-%% @doc Query handler - looks in cache for query and returns results
-query_handler(Req, query) ->
-    {ok, Body, Req1} = cowboy_req:read_body(Req),
+%%% =========================
+%%% WADE HTTP HANDLERS
+%%% =========================
+
+%% @doc Handler for POST /query.
+-spec query_handler(#req{}) -> {integer(), binary(), [{string(), string()}]}.
+query_handler(Req) ->
+    Body = wade:body(Req, "body", <<>>), %% Body as binary
     EmbryoList = generate_embryo_list(Body),
-    
     JsonResponse = jsx:encode(embryo_list_to_json(EmbryoList)),
-    
-    Req2 = cowboy_req:reply(200, 
-                           #{<<"content-type">> => <<"application/json">>}, 
-                           JsonResponse, 
-                           Req1),
-    {ok, Req2, query}.
+    {200, JsonResponse, [{"content-type", "application/json"}]}.
 
-%% @doc Cache handler - stores query+result in cache and returns query key
-cache_handler(Req, cache) ->
-    {ok, Body, Req1} = cowboy_req:read_body(Req),
+%% @doc Handler for POST /cache.
+-spec cache_handler(#req{}) -> {integer(), binary(), [{string(), string()}]}.
+cache_handler(Req) ->
+    Body = wade:body(Req, "body", <<>>),
     Data = jsx:decode(Body, [return_maps]),
-    
     Query = maps:get(<<"query">>, Data),
     ResultJson = maps:get(<<"results">>, Data),
-    
-    % Convert ResultJson to embryo_list
+
     Result = case is_binary(ResultJson) of
-        true -> 
-            % It's already a binary/JSON string
-            json_to_embryo_list(ResultJson);
-        false -> 
-            % It's already a map/object
-            json_to_embryo_list(ResultJson)
+        true  -> json_to_embryo_list(ResultJson);
+        false -> json_to_embryo_list(ResultJson)
     end,
-    
+
     ok = add_to_cache(Query, Result),
-    
-    Req2 = cowboy_req:reply(200, 
-                           #{<<"content-type">> => <<"text/plain">>}, 
-                           Query, 
-                           Req1),
-    {ok, Req2, cache}.
+    {200, Query, [{"content-type", "text/plain"}]}.
 
-%%====================================================================
-%% Internal functions
-%%====================================================================
+%%% ====================
+%%% INTERNALS
+%%% ====================
 
-%% @doc Add query and results to Redis cache
+%% @doc Add query/results to Redis as JSON.
+-spec add_to_cache(binary(), #embryo_list{}) -> ok.
 add_to_cache(Query, Results) ->
     {ok, Redis} = eredis:start_link(),
     JsonResults = jsx:encode(embryo_list_to_json(Results)),
@@ -109,76 +89,63 @@ add_to_cache(Query, Results) ->
     eredis:stop(Redis),
     ok.
 
-%% @doc Generate embryo list from query in cache
+%% @doc Fetch query result from cache, decode to embryo_list record.
+-spec generate_embryo_list(binary()) -> #embryo_list{}.
 generate_embryo_list(JsonString) ->
     Data = jsx:decode(JsonString, [return_maps]),
     Query = maps:get(<<"query">>, Data),
-    
     {ok, Redis} = eredis:start_link(),
-    case eredis:q(Redis, ["GET", Query]) of
-        {ok, Result} when Result /= undefined ->
-            eredis:stop(Redis),
-            json_to_embryo_list(Result);
-        _ ->
-            eredis:stop(Redis),
-            #embryo_list{embryo_list = []}
+    Result = case eredis:q(Redis, ["GET", Query]) of
+        {ok, Value} when Value /= undefined -> Value;
+        _ -> undefined
+    end,
+    eredis:stop(Redis),
+    case Result of
+        undefined -> #embryo_list{embryo_list = []};
+        _ -> json_to_embryo_list(Result)
     end.
 
-%% @doc Find an available port
-find_port() ->
-    % Start with port 8000 and try sequentially if occupied
-    find_port_from(8000).
-
+%% @doc Find an available TCP port for Wade.
+-spec find_port() -> {ok, integer()} | {error, any()}.
+find_port() -> find_port_from(8000).
 find_port_from(Port) when Port < 9000 ->
     case gen_tcp:listen(Port, []) of
         {ok, Socket} ->
             gen_tcp:close(Socket),
             {ok, Port};
-        {error, _} ->
-            find_port_from(Port + 1)
+        {error, _} -> find_port_from(Port + 1)
     end;
-find_port_from(_) ->
-    {error, no_available_port}.
+find_port_from(_) -> {error, no_available_port}.
 
-%% @doc Register this filter with the main service
-register_filter() ->
-    % This is a placeholder - would need to be implemented based on em_filter module
-    % from the original code
-    ok.
+%% @doc Dummy stub (implement real integration as needed).
+-spec register_filter() -> ok.
+register_filter() -> ok.
 
-%%====================================================================
-%% Conversion Helper Functions
-%%====================================================================
+%%% =========================
+%%% JSON/RECORD CONVERSION
+%%% =========================
 
-%% @doc Convert from JSON to embryo_list record
+-spec json_to_embryo_list(binary() | map()) -> #embryo_list{}.
 json_to_embryo_list(Json) when is_binary(Json) ->
     Data = jsx:decode(Json, [return_maps]),
     json_to_embryo_list(Data);
 json_to_embryo_list(#{<<"embryo_list">> := EmbryoList}) ->
-    #embryo_list{
-        embryo_list = [json_to_embryo(Embryo) || Embryo <- EmbryoList]
-    };
-%% Handle the case when we receive a map with query and results
+    #embryo_list{embryo_list = [json_to_embryo(Embryo) || Embryo <- EmbryoList]};
 json_to_embryo_list(#{<<"query">> := _, <<"results">> := Results}) ->
-    % Extract results and process them as a string
     json_to_embryo_list(Results);
-%% Fallback case
 json_to_embryo_list(_) ->
-    % Return an empty embryo list if we can't parse
     #embryo_list{embryo_list = []}.
 
-%% @doc Convert from JSON to embryo record
+-spec json_to_embryo(map()) -> #embryo{}.
 json_to_embryo(#{<<"properties">> := Properties}) ->
     #embryo{properties = Properties}.
 
-%% @doc Convert from embryo_list record to JSON
+-spec embryo_list_to_json(#embryo_list{}) -> map().
 embryo_list_to_json(#embryo_list{embryo_list = EmbryoList}) ->
-    #{
-        <<"embryo_list">> => [embryo_to_json(Embryo) || Embryo <- EmbryoList]
-    }.
+    #{<<"embryo_list">> => [embryo_to_json(Embryo) || Embryo <- EmbryoList]}.
 
-%% @doc Convert from embryo record to JSON
+-spec embryo_to_json(#embryo{}) -> map().
 embryo_to_json(#embryo{properties = Properties}) ->
-    #{
-        <<"properties">> => Properties
-    }.
+    #{<<"properties">> => Properties}.
+
+
