@@ -6,10 +6,11 @@
 %%% embryo lists. Integrates with Redis for persistence.
 %%%
 %%% Features:
-%%%  - Automatic port discovery (8000–9000)
-%%%  - JSON encoding/decoding with jsx
-%%%  - Robust request body parsing
+%%%  - Automatic TCP port discovery (8000–9000)
+%%%  - JSON encoding/decoding with jsone
+%%%  - Robust request body parsing (binary, map, or x-www-form-urlencoded)
 %%%  - Wade HTTP server integration
+%%%  - Redis cache persistence
 %%%-------------------------------------------------------------------
 
 -module(em_cache).
@@ -17,11 +18,16 @@
 %% API
 -export([start/0, init/0]).
 
-%% Internal functions for testing and Wade routes
+%% Internal functions for Wade routes & testing
 -export([
-    add_to_cache/2, generate_embryo_list/1, register_filter/0,
-    json_to_embryo_list/1, embryo_list_to_json/1,
-    register_routes/0, query_handler/1, cache_handler/1
+    add_to_cache/2,
+    generate_embryo_list/1,
+    register_filter/0,
+    json_to_embryo_list/1,
+    embryo_list_to_json/1,
+    register_routes/0,
+    query_handler/1,
+    cache_handler/1
 ]).
 
 -include_lib("wade/include/wade.hrl").
@@ -42,29 +48,29 @@ start() ->
 
 -spec init() -> ok | {error, any()}.
 init() ->
-    %% Ensure required applications are started
+    %% Start required applications
     application:ensure_all_started(eredis),
-    application:ensure_all_started(jsx),
+    application:ensure_all_started(jsone),
 
-    %% Find available TCP port
+    %% Find an available TCP port
     {ok, Port} = find_port(),
 
     %% Start Wade HTTP server
     {ok, _Pid} = wade:start_link(Port),
 
-    %% Register routes
+    %% Register HTTP routes
     register_routes(),
 
     io:format("[INFO] em_cache started on port ~p~n", [Port]),
 
-    %% Register service with discovery (stub)
+    %% Register with service discovery (stub)
     register_filter(),
 
     ok.
 
 %%-------------------------------------------------------------------
-%% HTTP route registration
-%%-------------------------------------------------------------------
+%%% HTTP route registration
+%%%-------------------------------------------------------------------
 -spec register_routes() -> ok.
 register_routes() ->
     wade:route(post, "/query", fun ?MODULE:query_handler/1, []),
@@ -78,23 +84,20 @@ register_routes() ->
 %% @doc Handles POST /query requests
 -spec query_handler(#req{}) -> {integer(), binary(), [{string(), string()}]}.
 query_handler(Req) ->
-    Body = wade:body(Req, "body", <<>>), %% get body as binary
+    Body = wade:body(Req, "body", <<>>),
     EmbryoList = generate_embryo_list(Body),
-    JsonResponse = jsx:encode(embryo_list_to_json(EmbryoList)),
+    JsonResponse = jsone:encode(embryo_list_to_json(EmbryoList)),
     {200, JsonResponse, [{"content-type", "application/json"}]}.
 
 %% @doc Handles POST /cache requests
 -spec cache_handler(#req{}) -> {integer(), binary(), [{string(), string()}]}.
 cache_handler(Req) ->
     Body = wade:body(Req, "body", <<>>),
-    Data = jsx:decode(Body, [return_maps]),
-    Query = maps:get(<<"query">>, Data),
-    ResultJson = maps:get(<<"results">>, Data),
+    Data = decode_body_safe(Body),
+    Query = maps:get(<<"query">>, Data, <<>>),
+    ResultJson = maps:get(<<"results">>, Data, #{}),
 
-    Result = case is_binary(ResultJson) of
-        true -> json_to_embryo_list(ResultJson);
-        false -> json_to_embryo_list(ResultJson)
-    end,
+    Result = decode_results_safe(ResultJson),
 
     %% Store in Redis
     ok = add_to_cache(Query, Result),
@@ -109,7 +112,7 @@ cache_handler(Req) ->
 -spec add_to_cache(binary(), #embryo_list{}) -> ok.
 add_to_cache(Query, Results) ->
     {ok, Redis} = eredis:start_link(),
-    JsonResults = jsx:encode(embryo_list_to_json(Results)),
+    JsonResults = jsone:encode(embryo_list_to_json(Results)),
     {ok, <<"OK">>} = eredis:q(Redis, ["SET", Query, JsonResults]),
     eredis:stop(Redis),
     ok.
@@ -117,20 +120,46 @@ add_to_cache(Query, Results) ->
 %% @doc Retrieve query results from Redis
 -spec generate_embryo_list(binary()) -> #embryo_list{}.
 generate_embryo_list(JsonString) ->
-    Data = jsx:decode(JsonString, [return_maps]),
-    Query = maps:get(<<"query">>, Data),
+    Data = decode_body_safe(JsonString),
+    Query = maps:get(<<"query">>, Data, <<>>),
     {ok, Redis} = eredis:start_link(),
     Result = case eredis:q(Redis, ["GET", Query]) of
-        {ok, Value} when Value /= undefined -> Value;
-        _ -> undefined
+        {ok, Value} when Value /= undefined ->
+            decode_results_safe(Value);
+        _ ->
+            #embryo_list{embryo_list = []}
     end,
     eredis:stop(Redis),
-    case Result of
-        undefined -> #embryo_list{embryo_list = []};
-        _ -> json_to_embryo_list(Result)
-    end.
+    Result.
 
-%% @doc Find available TCP port between 8000–9000
+%% @doc Safe decoding of request bodies (binary JSON, map, or fallback)
+-spec decode_body_safe(binary() | map() | list()) -> map().
+decode_body_safe(Body) when is_binary(Body) ->
+    case catch jsone:decode(Body) of
+        {'EXIT', _} -> #{}; %% invalid JSON fallback
+        Map -> Map
+    end;
+decode_body_safe(Body) when is_map(Body) ->
+    Body;
+decode_body_safe(Body) when is_list(Body) ->
+    %% Convert list of tuples [{key,value}] to map
+    maps:from_list([{to_binary(K), to_binary(V)} || {K,V} <- Body]);
+decode_body_safe(_) ->
+    #{}.
+
+%% @doc Safe decoding of stored results (binary JSON or map)
+-spec decode_results_safe(binary() | map()) -> #embryo_list{}.
+decode_results_safe(Bin) when is_binary(Bin) ->
+    case catch jsone:decode(Bin) of
+        {'EXIT', _} -> #embryo_list{embryo_list = []};
+        Map -> json_to_embryo_list(Map)
+    end;
+decode_results_safe(Map) when is_map(Map) ->
+    json_to_embryo_list(Map);
+decode_results_safe(_) ->
+    #embryo_list{embryo_list = []}.
+
+%% @doc Find available TCP port 8000–9000
 -spec find_port() -> {ok, integer()} | {error, any()}.
 find_port() -> find_port_from(8000).
 
@@ -154,8 +183,10 @@ register_filter() -> ok.
 
 -spec json_to_embryo_list(binary() | map()) -> #embryo_list{}.
 json_to_embryo_list(Json) when is_binary(Json) ->
-    Data = jsx:decode(Json, [return_maps]),
-    json_to_embryo_list(Data);
+    case catch jsone:decode(Json) of
+        {'EXIT', _} -> #embryo_list{embryo_list = []};
+        Map -> json_to_embryo_list(Map)
+    end;
 json_to_embryo_list(#{<<"embryo_list">> := EmbryoList}) ->
     #embryo_list{embryo_list = [json_to_embryo(E) || E <- EmbryoList]};
 json_to_embryo_list(#{<<"query">> := _, <<"results">> := Results}) ->
@@ -175,3 +206,11 @@ embryo_list_to_json(#embryo_list{embryo_list = List}) ->
 embryo_to_json(#embryo{properties = Properties}) ->
     #{<<"properties">> => Properties}.
 
+%%-------------------------------------------------------------------
+%% Utility: convert string/list to binary safely
+%%-------------------------------------------------------------------
+-spec to_binary(binary() | list() | atom() | integer()) -> binary().
+to_binary(X) when is_binary(X) -> X;
+to_binary(X) when is_list(X) -> list_to_binary(X);
+to_binary(X) when is_atom(X) -> list_to_binary(atom_to_list(X));
+to_binary(X) when is_integer(X) -> list_to_binary(io_lib:format("~p", [X])).
