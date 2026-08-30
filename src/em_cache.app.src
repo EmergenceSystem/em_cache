@@ -1,17 +1,22 @@
 {application, em_cache, [
-    {description, "Cache service for embryo queries"},
-    {vsn, "0.1.0"},
-    {registered, []},
+    {description, "Two-tier (ETS + optional Redis) query result cache for Emergence"},
+    {vsn, "0.2.0"},
+    {registered, [em_cache_sup, em_cache_store]},
     {mod, {em_cache_app, []}},
     {applications, [
         kernel,
         stdlib,
+        crypto,
         cowboy,
         eredis
     ]},
-    {env, []},
+    {env, [
+        {port, 8300},
+        {redis_host, "127.0.0.1"},
+        {redis_port, 6379},
+        {ttl, 3600}
+    ]},
     {modules, []},
-    {licenses, ["Apache 2.0"]},
-    {links, []}
+    {licenses, ["Apache-2.0"]},
+    {links, [{"GitHub", "https://github.com/EmergenceSystem/em_cache"}]}
 ]}.
-

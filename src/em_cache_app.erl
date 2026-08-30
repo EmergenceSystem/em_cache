@@ -1,10 +1,12 @@
 %%%-------------------------------------------------------------------
 %%% @doc em_cache application entry point.
 %%%
-%%% Starts a Cowboy HTTP server on an available port (8000-9000)
-%%% with two endpoints:
-%%%   POST /query  — retrieve cached embryo list from Redis
-%%%   POST /cache  — store embryo list in Redis
+%%% Starts the supervisor (which owns the ETS cache + Redis lifecycle)
+%%% then a Cowboy server on the configured port (`[env] port',
+%%% default 8300) with:
+%%%   POST /query  — retrieve a cached embryo list
+%%%   POST /cache  — store an embryo list (optional `ttl' field)
+%%%   GET  /health — backend health + hit/miss stats
 %%% @end
 %%%-------------------------------------------------------------------
 -module(em_cache_app).
@@ -13,26 +15,21 @@
 -export([start/2, stop/1]).
 
 start(_StartType, _StartArgs) ->
-    {ok, Port} = find_port(8000),
+    {ok, Sup} = em_cache_sup:start_link(),
+    Port = application:get_env(em_cache, port, 8300),
     Dispatch = cowboy_router:compile([
         {'_', [
-            {"/query", em_cache_query_handler, []},
-            {"/cache", em_cache_store_handler, []}
+            {"/query",  em_cache_query_handler, []},
+            {"/cache",  em_cache_store_handler, []},
+            {"/health", em_cache_health_handler, []}
         ]}
     ]),
     {ok, _} = cowboy:start_clear(em_cache_listener,
         [{port, Port}],
-        #{env => #{dispatch => Dispatch}}
-    ),
+        #{env => #{dispatch => Dispatch}}),
     io:format("[em_cache] started on port ~p~n", [Port]),
-    em_cache_sup:start_link().
+    {ok, Sup}.
 
 stop(_State) ->
-    cowboy:stop_listener(em_cache_listener).
-
-find_port(Port) when Port >= 9000 -> {error, no_available_port};
-find_port(Port) ->
-    case gen_tcp:listen(Port, []) of
-        {ok, S}   -> gen_tcp:close(S), {ok, Port};
-        {error, _} -> find_port(Port + 1)
-    end.
+    catch cowboy:stop_listener(em_cache_listener),
+    ok.
